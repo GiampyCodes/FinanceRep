@@ -1,0 +1,223 @@
+import pandas as pd
+from datetime import date
+from edgar import *
+
+set_identity("Giampaolo Sacco giampysacco16@gmail.com")
+pd.options.display.float_format = '{:,.0f}'.format
+
+ticker = "AAPL"
+company = Company(ticker)
+
+# ── Role keywords mapped by filing era ──────────────────────────────────────
+PRODUCT_ROLES = [
+    "RevenueDisaggregatedNetSales",                          # 2023–2025
+    "RevenueNetSalesDisaggregatedbySignificantProducts",     # 2022
+    "RevenueRecognitionNetSalesDisaggregatedbySignificant",  # 2020–2021
+    "RevenueRecognitionNetSalesDisaggregatedBySignificant",  # 2019
+    "SegmentInformationAndGeographicDataNetSalesByProduct",  # 2018
+]
+
+GEO_ROLES = [
+    "RevenueDisaggregatedGeographicAreas",                   # 2024–2025
+    "RevenueDisaggregatedbyGeography",                       # 2023–2024
+    "SegmentInformationandGeographicDataNetSalesDetails",    # 2020–2022
+    "SegmentInformationAndGeographicDataNetSalesDetails",    # 2018–2019
+    "GeographicInformation",
+    "SegmentGeographic",
+]
+
+# Words that indicate a statement is NOT a geo segment table
+GEO_EXCLUSION_KEYWORDS = [
+    "statementofoperations", "incomestatement", "balancesheet",
+    "cashflow", "stockholdersequity", "consolidatedstatements",
+    "comprehensiveincome"
+]
+
+def find_statement(statements, role_keywords):
+    for keyword in role_keywords:
+        match = next((s for s in statements if keyword.lower() in s.role_or_type.lower()), None)
+        if match:
+            return match
+    return None
+
+def find_geo_statement_fuzzy(statements):
+    """
+    Fallback: scan all statements for one that contains geographic region names.
+    Excludes any financial statements (income statement, balance sheet, etc.)
+    """
+    GEO_SIGNALS = ['americas', 'europe', 'greater china', 'japan', 'asia']
+    for s in statements:
+        # Skip known financial statement roles
+        role_lower = s.role_or_type.lower().replace(" ", "").replace("-", "")
+        if any(excl in role_lower for excl in GEO_EXCLUSION_KEYWORDS):
+            continue
+        try:
+            df = s.to_dataframe()
+            if 'label' in df.columns:
+                labels = df['label'].astype(str).str.lower()
+                matches = sum(labels.str.contains(sig).any() for sig in GEO_SIGNALS)
+                if matches >= 3:
+                    return s
+        except Exception:
+            continue
+    return None
+
+def extract_df(statement, geo=False):
+    """Extract clean year columns from a statement."""
+    df = statement.to_dataframe()
+    # Drop duplicate labels to avoid reindex errors
+    df = df.drop_duplicates(subset=['label'])
+    year_cols = [c for c in df.columns if '20' in str(c)]
+    if not year_cols:
+        return None
+    df = df[['label'] + year_cols].copy()
+    for col in year_cols:
+        df[col] = pd.to_numeric(
+            df[col].astype(str).str.replace(',', '').str.strip(), errors='coerce'
+        ) / 1_000_000
+    df.columns = ['label'] + [c[:4] for c in sorted(year_cols, reverse=True)]
+    if geo:
+        df['label'] = df['label'].str.replace('Operating segments - ', '', regex=False).str.strip()
+    return df
+
+def build_yoy_growth(df):
+    has_total = 'Total Net Sales' in df.index
+    if has_total:
+        total_row = df.loc[['Total Net Sales']]
+        segment_df = df.drop(index='Total Net Sales')
+    else:
+        segment_df = df.copy()
+
+    year_cols = list(segment_df.columns)
+
+    growth_data = {}
+    for i in range(len(year_cols) - 1):
+        curr_yr = year_cols[i]
+        prev_yr = year_cols[i + 1]
+        label = f"{curr_yr} vs {prev_yr}"
+        curr = segment_df[curr_yr]
+        prev = segment_df[prev_yr]
+        growth_data[label] = ((curr - prev) / prev.abs() * 100).round(1)
+
+    if not growth_data:
+        return None
+
+    growth_df = pd.DataFrame(growth_data, index=segment_df.index)
+
+    if has_total:
+        total_growth = {}
+        for col in growth_df.columns:
+            curr_yr, prev_yr = col.split(' vs ')
+            curr = total_row[curr_yr].values[0]
+            prev = total_row[prev_yr].values[0]
+            total_growth[col] = round((curr - prev) / abs(prev) * 100, 1) if prev else None
+        growth_df.loc['Total Net Sales'] = total_growth
+
+    return growth_df
+
+def format_growth_df(growth_df):
+    formatted = growth_df.copy().astype(object)
+    for col in growth_df.columns:
+        for idx in growth_df.index:
+            val = growth_df.loc[idx, col]
+            if pd.isna(val):
+                formatted.loc[idx, col] = 'N/A'
+            else:
+                sign = '+' if val > 0 else ''
+                formatted.loc[idx, col] = f"{sign}{val:.1f}%"
+    return formatted
+
+# ── Fetch all 10-K filings ───────────────────────────────────────────────────
+print("Fetching 10-K filings...\n")
+filings = company.get_filings(form="10-K", amendments=False)
+
+all_products = {}
+all_geo = {}
+
+PRODUCT_ROWS = ['iPhone', 'Mac', 'iPad', 'Wearables', 'Services']
+GEO_ROWS     = ['Americas', 'Europe', 'Greater China', 'Japan', 'Rest of Asia']
+
+for filing in filings:
+    if filing.filing_date < date(2018, 1, 1):
+        break
+    try:
+        xbrl = filing.xbrl()
+        if xbrl is None:
+            continue
+        statements = xbrl.statements
+        print(f"  Processing {filing.filing_date}...")
+
+        # ── Product segments ────────────────────────────────────────────────
+        prod_stmt = find_statement(statements, PRODUCT_ROLES)
+        if prod_stmt:
+            df = extract_df(prod_stmt)
+            if df is not None:
+                df_filt = df[df['label'].str.contains('|'.join(PRODUCT_ROWS), case=False, na=False)]
+                for yr_col in [c for c in df_filt.columns if c != 'label']:
+                    if yr_col not in all_products:
+                        all_products[yr_col] = df_filt.set_index('label')[yr_col]
+
+        # ── Geographic segments ─────────────────────────────────────────────
+        geo_stmt = find_statement(statements, GEO_ROLES)
+        if geo_stmt is None:
+            geo_stmt = find_geo_statement_fuzzy(statements)
+            if geo_stmt:
+                print(f"    [geo fuzzy match] {geo_stmt.role_or_type}")
+            else:
+                print(f"    [geo] No matching statement found for {filing.filing_date}")
+
+        if geo_stmt:
+            df = extract_df(geo_stmt, geo=True)
+            if df is not None:
+                df_filt = df[df['label'].str.contains('|'.join(GEO_ROWS), case=False, na=False)]
+                for yr_col in [c for c in df_filt.columns if c != 'label']:
+                    if yr_col not in all_geo:
+                        all_geo[yr_col] = df_filt.set_index('label')[yr_col]
+
+    except Exception as e:
+        print(f"  Skipping {filing.filing_date}: {e}")
+
+print(f"\n  Geo years collected: {sorted(all_geo.keys(), reverse=True)}")
+
+# ── Build final tables ───────────────────────────────────────────────────────
+def build_table(data_dict, row_order):
+    df = pd.DataFrame(data_dict)
+    df = df.reindex(sorted(df.columns, reverse=True), axis=1)
+    df = df.reindex([r for r in row_order if r in df.index])
+    df.loc['Total Net Sales'] = df.sum()
+    return df
+
+PRODUCT_ORDER = ['iPhone', 'Mac', 'iPad', 'Wearables, Home and Accessories', 'Services']
+GEO_ORDER     = ['Americas', 'Europe', 'Greater China', 'Japan', 'Rest of Asia Pacific']
+
+df_products_final = build_table(all_products, PRODUCT_ORDER)
+df_geo_final      = build_table(all_geo, GEO_ORDER)
+
+# ── YoY Growth tables ────────────────────────────────────────────────────────
+df_products_growth = build_yoy_growth(df_products_final)
+df_geo_growth      = build_yoy_growth(df_geo_final)
+
+# ── Print output ─────────────────────────────────────────────────────────────
+print(f"\n--- Apple 10-K Revenue Segments (all available years) ---\n")
+
+print("=" * 90)
+print("  PRODUCT REVENUE SEGMENTS ($ millions)")
+print("=" * 90)
+print(df_products_final.to_string())
+
+if df_products_growth is not None:
+    print("\n" + "-" * 90)
+    print("  PRODUCT REVENUE — YEAR-OVER-YEAR GROWTH (%)")
+    print("-" * 90)
+    print(format_growth_df(df_products_growth).to_string())
+
+print("\n" + "=" * 90)
+print("  GEOGRAPHIC REVENUE SEGMENTS ($ millions)")
+print("=" * 90)
+print(df_geo_final.to_string())
+
+if df_geo_growth is not None:
+    print("\n" + "-" * 90)
+    print("  GEOGRAPHIC REVENUE — YEAR-OVER-YEAR GROWTH (%)")
+    print("-" * 90)
+    print(format_growth_df(df_geo_growth).to_string())
