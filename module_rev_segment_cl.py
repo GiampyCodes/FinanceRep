@@ -1,3 +1,5 @@
+import re
+import requests
 import pandas as pd
 from datetime import date
 from edgar import *
@@ -10,6 +12,20 @@ TICKER     = input("Enter ticker symbol (e.g. AAPL, MSFT, GOOGL): ").strip().upp
 START_DATE = date(2018, 1, 1)
 MAX_YEARS  = 8
 TOLERANCE  = 0.03
+
+# ── EDGAR FACTS API — revenue concept names to query ─────────────────────────
+EDGAR_REVENUE_CONCEPTS = [
+    'RevenueFromContractWithCustomerExcludingAssessedTax',
+    'RevenueFromContractWithCustomerIncludingAssessedTax',
+    'Revenues',
+    'SalesRevenueNet',
+    'RevenueNotFromContractWithCustomer',
+    'RevenuesNetOfInterestExpense',
+    'NetSales',
+]
+
+# Labels that indicate an XBRL member is a grand-total row (skip these)
+_TOTAL_MEMBER_KEYWORDS = ['total', 'consolidated', 'reportable', 'allother']
 
 # ── INCOME STATEMENT PATTERNS (for revenue anchor) ────────────────────────────
 IS_ROLE_PATTERNS = [
@@ -53,6 +69,8 @@ SKIP_STMT_KEYWORDS = [
     'longlivedasset', 'totalasset', 'employeecount',
     'scheduleii', 'valuationandqualifying',
     'auditinformation', 'coverpage',
+    # Other expense / non-operating tables — can look like revenue by coincidence
+    'otherexpense', 'othernonoperating', 'otherincomeandexpense',
 ]
 
 # Row-label keywords that indicate non-revenue rows inside a candidate table
@@ -157,6 +175,12 @@ TICKER_PRODUCT_ROWS = {
         'industrial & other',
         'industrial and other',
     ],
+    'LRCX': [
+        'system revenue',
+        'customer support-related revenue',
+        'systems',
+        'customer support-related',
+    ],
 }
 
 TICKER_GEO_ROWS = {
@@ -182,6 +206,16 @@ TICKER_GEO_ROWS = {
         'europe',
         'other',
         'americas',
+    ],
+    'LRCX': [
+        'china',
+        'korea',
+        'taiwan',
+        'japan',
+        'southeast asia',
+        'united states',
+        'europe',
+        'other',
     ],
 }
 
@@ -774,88 +808,257 @@ def print_validation(label, validation):
         print(f"    {status} {yr}: segments=${v['actual']:,.0f}M  |  anchor=${v['expected']:,.0f}M  |  diff={v['pct_diff']*100:.1f}%")
 
 
+# ── EDGAR Facts API (primary segment discovery path) ─────────────────────────
+
+def clean_member_label(member):
+    """Convert 'aapl:IPhoneMember' → 'I Phone', 'aapl:AmericasSegmentMember' → 'Americas'."""
+    label = member.split(':')[-1]
+    for suffix in ('SegmentMember', 'Member', 'Segment', 'Domain', 'Axis'):
+        if label.endswith(suffix):
+            label = label[:-len(suffix)]
+            break
+    label = re.sub(r'(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])', ' ', label)
+    return label.strip()
+
+
+def get_edgar_facts(cik):
+    """Fetch the full company facts JSON from SEC EDGAR."""
+    cik_str = str(int(cik)).zfill(10)
+    url = f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik_str}.json"
+    r = requests.get(
+        url,
+        headers={"User-Agent": "Giampaolo Sacco giampysacco16@gmail.com"},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+def extract_dimensional_revenue(facts_json, start_year=2018):
+    """
+    Parse EDGAR facts JSON for dimensional revenue facts.
+    Uses standard US-GAAP axes:
+      srt:ProductOrServiceAxis       → product/segment breakdown
+      srt:StatementGeographicalAxis  → geographic breakdown
+    Deduplicates by taking the latest-filed entry per (fiscal_year, member).
+
+    Returns:
+      product_by_year : {yr_str: {label: value_millions}}
+      geo_by_year     : {yr_str: {label: value_millions}}
+      total_by_year   : {yr_str: value_millions}   ← revenue anchor
+    """
+    us_gaap = facts_json.get('facts', {}).get('us-gaap', {})
+
+    prod_raw  = {}   # (yr, member) -> (filed_str, val_m, label)
+    geo_raw   = {}
+    total_raw = {}   # yr -> (filed_str, val_m)
+
+    for concept in EDGAR_REVENUE_CONCEPTS:
+        if concept not in us_gaap:
+            continue
+        for entry in us_gaap[concept].get('units', {}).get('USD', []):
+            if entry.get('form') not in ('10-K', '10-K/A'):
+                continue
+            if entry.get('fp') != 'FY':
+                continue
+            fy = entry.get('fy')
+            if not fy or int(fy) < start_year:
+                continue
+            val = entry.get('val', 0)
+            if not val or val <= 0:
+                continue
+
+            yr    = str(fy)
+            val_m = val / 1_000_000
+            filed = entry.get('filed', '')
+            seg   = entry.get('segment')
+
+            if seg is None:
+                # Un-dimensioned entry → total revenue anchor
+                existing = total_raw.get(yr)
+                if not existing or filed > existing[0]:
+                    total_raw[yr] = (filed, val_m)
+            else:
+                dim    = seg.get('dimension', '')
+                member = seg.get('member', '')
+                label  = clean_member_label(member)
+
+                # Skip grand-total members (e.g. "TotalMember")
+                if any(kw in label.lower().replace(' ', '') for kw in _TOTAL_MEMBER_KEYWORDS):
+                    continue
+
+                key = (yr, member)
+                if 'ProductOrService' in dim or 'StatementBusinessSegments' in dim:
+                    existing = prod_raw.get(key)
+                    if not existing or filed > existing[0]:
+                        prod_raw[key] = (filed, val_m, label)
+                elif 'StatementGeographical' in dim:
+                    existing = geo_raw.get(key)
+                    if not existing or filed > existing[0]:
+                        geo_raw[key] = (filed, val_m, label)
+
+    def _to_year_dict(raw):
+        result = {}
+        for (yr, _), (_, val_m, label) in raw.items():
+            result.setdefault(yr, {})[label] = val_m
+        return result
+
+    return (
+        _to_year_dict(prod_raw),
+        _to_year_dict(geo_raw),
+        {yr: vm for yr, (_, vm) in total_raw.items()},
+    )
+
+
+def _validate_facts_segments(seg_by_year, total_by_year, tolerance=TOLERANCE):
+    """
+    Keep only years where the segment values sum to total revenue ± tolerance.
+    Returns {yr: label_value_dict} for valid years only.
+    """
+    valid = {}
+    for yr, seg_dict in seg_by_year.items():
+        if yr not in total_by_year or not total_by_year[yr]:
+            continue
+        seg_sum  = sum(v for v in seg_dict.values() if v and v > 0)
+        expected = total_by_year[yr]
+        if abs(seg_sum - expected) / expected <= tolerance:
+            valid[yr] = seg_dict
+        else:
+            print(f"      [facts API] {yr} segments sum ${seg_sum:,.0f}M vs anchor ${expected:,.0f}M — skipped")
+    return valid
+
+
+def fetch_segments_from_facts_api(company, start_year=2018):
+    """
+    Primary path: pull product & geo segment revenue from the SEC EDGAR
+    company-facts API using standard US-GAAP dimensional XBRL tags.
+
+    Returns (all_products, all_geo, total_revenues) where each dict is
+    {yr_str: pd.Series({label: value_millions})}, or ({}, {}, {}) on failure.
+    """
+    try:
+        cik = company.cik
+        print(f"    CIK: {cik}")
+        facts_json = get_edgar_facts(cik)
+
+        prod_by_yr, geo_by_yr, total_by_yr = extract_dimensional_revenue(
+            facts_json, start_year
+        )
+
+        valid_prod = _validate_facts_segments(prod_by_yr, total_by_yr)
+        valid_geo  = _validate_facts_segments(geo_by_yr,  total_by_yr)
+
+        all_products   = {yr: pd.Series(d) for yr, d in valid_prod.items()}
+        all_geo        = {yr: pd.Series(d) for yr, d in valid_geo.items()}
+        total_revenues = total_by_yr
+
+        return all_products, all_geo, total_revenues
+
+    except Exception as e:
+        print(f"    [facts API error] {e}")
+        return {}, {}, {}
+
+
 # ── Main fetch loop ───────────────────────────────────────────────────────────
 print(f"\nFetching 10-K filings for {TICKER}...\n")
 company = Company(TICKER)
-filings = company.get_filings(form="10-K", amendments=False)
 
 all_products   = {}
 all_geo        = {}
 total_revenues = {}
 
-for filing in filings:
-    if filing.filing_date < START_DATE:
-        break
-    if len(all_products) >= MAX_YEARS and len(all_geo) >= MAX_YEARS:
-        break
+# ── Stage 1: EDGAR facts API (dimensional XBRL — most reliable) ──────────────
+print("  [Stage 1] EDGAR facts API (dimensional XBRL)...")
+all_products, all_geo, total_revenues = fetch_segments_from_facts_api(
+    company, start_year=START_DATE.year
+)
+print(f"    Product years : {sorted(all_products.keys(), reverse=True)}")
+print(f"    Geo years     : {sorted(all_geo.keys(), reverse=True)}")
 
-    print(f"  Processing {filing.filing_date}...")
-    try:
-        xbrl = filing.xbrl()
-        if xbrl is None:
-            continue
+# ── Stage 2: XBRL filing-by-filing fallback for any missing years ─────────────
+years_covered = {yr for yr in total_revenues if int(yr) >= START_DATE.year}
+missing_prod  = years_covered - set(all_products.keys())
+missing_geo   = years_covered - set(all_geo.keys())
 
-        filing_revenues = get_revenue_anchor(xbrl)
-        if not filing_revenues:
-            print(f"    [!] No revenue anchor — skipping")
-            continue
-        for yr, rev in filing_revenues.items():
-            if yr not in total_revenues:
-                total_revenues[yr] = rev
-        print(f"    Anchors: { {k: f'${v:,.0f}M' for k, v in sorted(filing_revenues.items(), reverse=True)} }")
+if missing_prod or missing_geo or not total_revenues:
+    print(f"\n  [Stage 2] XBRL fallback "
+          f"(missing prod={sorted(missing_prod, reverse=True)}, "
+          f"geo={sorted(missing_geo, reverse=True)})...")
+    filings = company.get_filings(form="10-K", amendments=False)
 
-        prod_stmt, geo_stmt = get_segment_statements(xbrl, filing_revenues)
+    for filing in filings:
+        if filing.filing_date < START_DATE:
+            break
+        if len(all_products) >= MAX_YEARS and len(all_geo) >= MAX_YEARS:
+            break
 
-        # ── Product segments ──
-        if prod_stmt:
-            df, year_cols = extract_df(prod_stmt, clean_prefix="Operating segments - ")
-            if df is not None:
-                print(f"    [product] {prod_stmt.role_or_type.split('/')[-1]}")
-                prod_allowlist = TICKER_PRODUCT_ROWS.get(TICKER)
-                if prod_allowlist:
-                    df_clean = apply_ticker_filter(df, prod_allowlist)
-                else:
-                    df_clean = clean_segment_rows(df, year_cols, filing_revenues)
-                df_set = df_clean.set_index('label')
-                added = []
-                for yr in year_cols:
-                    if yr not in all_products and yr in total_revenues:
-                        col = pd.to_numeric(df_set[yr], errors='coerce').dropna()
-                        col = col[col > 0]
-                        if not col.empty:
-                            all_products[yr] = col
-                            added.append(yr)
-                if added:
-                    print(f"             years added: {added}")
-        else:
-            print(f"    [!] No product statement found")
+        print(f"  Processing {filing.filing_date}...")
+        try:
+            xbrl = filing.xbrl()
+            if xbrl is None:
+                continue
 
-        # ── Geographic segments ──
-        if geo_stmt:
-            df, year_cols = extract_df(geo_stmt, clean_prefix="Operating segments - ")
-            if df is not None:
-                print(f"    [geo]     {geo_stmt.role_or_type.split('/')[-1]}")
-                geo_allowlist = TICKER_GEO_ROWS.get(TICKER)
-                if geo_allowlist:
-                    df_clean = apply_ticker_filter(df, geo_allowlist)
-                else:
-                    df_clean = clean_segment_rows(df, year_cols, filing_revenues)
-                df_set = df_clean.set_index('label')
-                added = []
-                for yr in year_cols:
-                    if yr not in all_geo and yr in total_revenues:
-                        col = pd.to_numeric(df_set[yr], errors='coerce').dropna()
-                        col = col[col > 0]
-                        if not col.empty:
-                            all_geo[yr] = col
-                            added.append(yr)
-                if added:
-                    print(f"             years added: {added}")
-        else:
-            print(f"    [!] No geo statement found")
+            filing_revenues = get_revenue_anchor(xbrl)
+            if not filing_revenues:
+                print(f"    [!] No revenue anchor — skipping")
+                continue
+            for yr, rev in filing_revenues.items():
+                if yr not in total_revenues:
+                    total_revenues[yr] = rev
+            print(f"    Anchors: { {k: f'${v:,.0f}M' for k, v in sorted(filing_revenues.items(), reverse=True)} }")
 
-    except Exception as e:
-        print(f"  Skipping {filing.filing_date}: {e}")
+            prod_stmt, geo_stmt = get_segment_statements(xbrl, filing_revenues)
+
+            # ── Product segments ──
+            if prod_stmt:
+                df, year_cols = extract_df(prod_stmt, clean_prefix="Operating segments - ")
+                if df is not None:
+                    print(f"    [product] {prod_stmt.role_or_type.split('/')[-1]}")
+                    prod_allowlist = TICKER_PRODUCT_ROWS.get(TICKER)
+                    if prod_allowlist:
+                        df_clean = apply_ticker_filter(df, prod_allowlist)
+                    else:
+                        df_clean = clean_segment_rows(df, year_cols, filing_revenues)
+                    df_set = df_clean.set_index('label')
+                    added = []
+                    for yr in year_cols:
+                        if yr not in all_products and yr in total_revenues:
+                            col = pd.to_numeric(df_set[yr], errors='coerce').dropna()
+                            col = col[col > 0]
+                            if not col.empty:
+                                all_products[yr] = col
+                                added.append(yr)
+                    if added:
+                        print(f"             years added: {added}")
+            else:
+                print(f"    [!] No product statement found")
+
+            # ── Geographic segments ──
+            if geo_stmt:
+                df, year_cols = extract_df(geo_stmt, clean_prefix="Operating segments - ")
+                if df is not None:
+                    print(f"    [geo]     {geo_stmt.role_or_type.split('/')[-1]}")
+                    geo_allowlist = TICKER_GEO_ROWS.get(TICKER)
+                    if geo_allowlist:
+                        df_clean = apply_ticker_filter(df, geo_allowlist)
+                    else:
+                        df_clean = clean_segment_rows(df, year_cols, filing_revenues)
+                    df_set = df_clean.set_index('label')
+                    added = []
+                    for yr in year_cols:
+                        if yr not in all_geo and yr in total_revenues:
+                            col = pd.to_numeric(df_set[yr], errors='coerce').dropna()
+                            col = col[col > 0]
+                            if not col.empty:
+                                all_geo[yr] = col
+                                added.append(yr)
+                    if added:
+                        print(f"             years added: {added}")
+            else:
+                print(f"    [!] No geo statement found")
+
+        except Exception as e:
+            print(f"  Skipping {filing.filing_date}: {e}")
 
 # ── Build and validate ────────────────────────────────────────────────────────
 df_prod = build_table(all_products)
